@@ -14,12 +14,15 @@ name: Publish LumenOS packages
 # One job, in the environment apt-publish (deployment branch main), which holds the secrets:
 #   1. checks out LumenOS's branch main with a read-only token;
 #   2. reads what is published and stops early when main's build inputs (Ubuntu's newest version
-#      of every rebuilt package and every file of packaging/ and tools/packaging/) equal the
-#      published ones, unless a run by hand asks for a forced one; it stops with the reason when
-#      Ubuntu's newest version of a rebuilt package does not sort above our published build;
+#      of every rebuilt package, the newest kit release and every file of packaging/ and
+#      tools/packaging/) equal the published ones, unless a run by hand asks for a forced one; it
+#      stops with the reason when Ubuntu's newest version of a rebuilt package does not sort above
+#      our published build;
 #   3. builds every packaging/*/build.sh in its own ubuntu:26.04 container without any secret (as
-#      files-rebuild.yml does), installs them in a fresh one and checks them; a failure prints the
-#      command that reproduces it in LumenOS, never the log;
+#      files-rebuild.yml does), and the kit itself, the lumenos package, from the newest release tag
+#      (tools/packaging/kit_release.py, packaging/lumenos/make-deb.sh); installs them in a fresh
+#      container and checks them; a failure prints the command that reproduces it in LumenOS, never
+#      the log;
 #   4. merges them with the published index and checks it with gpgv and apt in an ubuntu:26.04
 #      container; signs it with SHA512 in another one that never sees a built package, whose
 #      network is cut before the key reaches its signing command, and which is removed after it;
@@ -70,6 +73,8 @@ jobs:
           token: ${{ secrets.LUMENOS_READ_TOKEN }}
           path: lumenos
           persist-credentials: false
+          # The release tags too: the lumenos package is built from the newest one.
+          fetch-depth: 0
 
       - name: Start the ubuntu:26.04 tools container
         run: |
@@ -82,6 +87,9 @@ jobs:
             apt-utils ca-certificates gnupg gpgv python3
           python3 lumenos/tools/packaging/openpgp.py dearmor \
             lumenos/packaging/lumenos-archive-keyring/lumenos-archive-keyring.asc >work/keyring.gpg
+
+      - name: Find the kit release the lumenos package is built from
+        run: python3 lumenos/tools/packaging/kit_release.py newest --repo lumenos --out work/kit-release.json
 
       - name: Read what is published
         env:
@@ -97,7 +105,8 @@ jobs:
           FORCE: ${{ inputs.force }}
         run: |
           docker exec --workdir /work tools python3 /kit/tools/packaging/apt_publish.py inputs \
-            --kit /kit --state state --keyring keyring.gpg --out inputs.json --force "$FORCE"
+            --kit /kit --state state --keyring keyring.gpg --out inputs.json --force "$FORCE" \
+            --kit-release kit-release.json
           echo "publish=$(jq -r 'if .publish then "true" else "false" end' work/inputs.json)" >> "$GITHUB_OUTPUT"
 
       - name: Build the packages, each in its own ubuntu:26.04 container (logs stay private)
@@ -119,13 +128,30 @@ jobs:
             echo "Built $name: $(find "work/built/$name" -maxdepth 1 -name '*.deb' -printf '%f ' | sort)"
           done
 
+      - name: Build the kit itself (the lumenos package) from the newest release tag
+        if: steps.inputs.outputs.publish == 'true'
+        run: |
+          mkdir -p work/kit "$RUNNER_TEMP/logs"
+          tag="$(jq -r '.tag' work/kit-release.json)"
+          if [ -z "$tag" ]; then
+            echo "No release can be a package yet: no lumenos package in this publish."
+            exit 0
+          fi
+          python3 lumenos/tools/packaging/kit_release.py export --repo lumenos --tag "$tag" --out work/kit-tree
+          if ! docker exec --workdir /work tools bash /kit/packaging/lumenos/make-deb.sh --tree kit-tree --out kit \
+            >"$RUNNER_TEMP/logs/lumenos.log" 2>&1; then
+            echo "::error::The build of the lumenos package from $tag failed; its log is not shown in this public repository. Reproduce it in LumenOS: git archive $tag | tar -x -C /tmp/kit-tree, then bash packaging/lumenos/make-deb.sh --tree /tmp/kit-tree --out /tmp/kit"
+            exit 1
+          fi
+          echo "Built lumenos from $tag: $(find work/kit -maxdepth 1 -name '*.deb' -printf '%f ' | sort)"
+
       - name: Install them in a fresh ubuntu:26.04 container and check them (log stays private)
         if: steps.inputs.outputs.publish == 'true'
         run: |
           if ! docker run --rm --init --volume "$PWD/lumenos:/kit:ro" --volume "$PWD/work/built:/built:ro" \
-            --env LUMENOS_IN_BUILD_CONTAINER=1 --workdir /kit ubuntu:26.04 \
-            bash tools/packaging/install_check.sh /built >"$RUNNER_TEMP/logs/install-check.log" 2>&1; then
-            echo "::error::The install check failed; its log is not shown in this public repository. Reproduce it in LumenOS: build the packages into DIR as above, then docker run --rm -v \"\$PWD:/kit:ro\" -v DIR:/built:ro -e LUMENOS_IN_BUILD_CONTAINER=1 -w /kit ubuntu:26.04 bash tools/packaging/install_check.sh /built"
+            --volume "$PWD/work/kit:/kit-package:ro" --env LUMENOS_IN_BUILD_CONTAINER=1 --workdir /kit ubuntu:26.04 \
+            bash tools/packaging/install_check.sh /built /kit-package >"$RUNNER_TEMP/logs/install-check.log" 2>&1; then
+            echo "::error::The install check failed; its log is not shown in this public repository. Reproduce it in LumenOS: build the packages into DIR and the lumenos package into KIT as above, then docker run --rm -v \"\$PWD:/kit:ro\" -v DIR:/built:ro -v KIT:/kit-package:ro -e LUMENOS_IN_BUILD_CONTAINER=1 -w /kit ubuntu:26.04 bash tools/packaging/install_check.sh /built /kit-package"
             exit 1
           fi
           echo "The install check passed."
@@ -138,7 +164,7 @@ jobs:
             --inputs work/inputs.json --out work/incoming
           docker exec --workdir /work tools bash /kit/packaging/lumenos-archive-keyring/make-deb.sh --out keyring
           docker exec --workdir /work tools python3 /kit/tools/packaging/apt_repo.py build --state state \
-            --incoming incoming --incoming keyring --keyring keyring.gpg \
+            --incoming incoming --incoming keyring --incoming kit --keyring keyring.gpg \
             --withdrawn /kit/packaging/apt-withdrawn.txt --out out
           cat work/out/summary.md >> "$GITHUB_STEP_SUMMARY"
           echo "changed=$(jq -r 'if .changed then "true" else "false" end' work/out/plan.json)" >> "$GITHUB_OUTPUT"
