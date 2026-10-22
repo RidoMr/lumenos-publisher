@@ -1,0 +1,197 @@
+name: Publish LumenOS packages
+
+# Builds LumenOS's packages and publishes them to its apt repository, apt.lu-os.com (a private R2
+# bucket behind a Worker). This repository is public, so the job runs on GitHub's hosted runners for
+# free; LumenOS itself stays private. The source of truth of this file is
+# tools/packaging/publisher/publish.yml in RidoMr/LumenOS, with its tests; copy it here unchanged.
+# See packaging/README.md, "Publishing", there.
+#
+# Everything this job prints is public. It prints package names, versions and counts only: build
+# and install-check logs stay on the runner, the upload prints only its counts, and the account id
+# and the bucket name are masked. Nothing is uploaded as an artifact or kept in a cache (anyone
+# signed in can download a public repository's artifacts).
+#
+# One job, in the environment apt-publish (deployment branch main), which holds the secrets:
+#   1. checks out LumenOS's branch main with a read-only token;
+#   2. reads what is published and stops early when main's build inputs (Ubuntu's newest version
+#      of every rebuilt package and every file of packaging/ and tools/packaging/) equal the
+#      published ones, unless a run by hand asks for a forced one; it stops with the reason when
+#      Ubuntu's newest version of a rebuilt package does not sort above our published build;
+#   3. builds every packaging/*/build.sh in its own ubuntu:26.04 container without any secret (as
+#      files-rebuild.yml does), installs them in a fresh one and checks them; a failure prints the
+#      command that reproduces it in LumenOS, never the log;
+#   4. merges them with the published index and checks it with gpgv and apt in an ubuntu:26.04
+#      container; signs it with SHA512 in another one that never sees a built package, whose
+#      network is cut before the key reaches its signing command, and which is removed after it;
+#   5. uploads (the R2 token only in the steps that read or write the bucket, on the runner) and
+#      records the build inputs; then reads the index back and shows its key and packages.
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build and publish even when the build inputs equal the published ones'
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: apt-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, sign and publish
+    if: github.repository == 'RidoMr/lumenos-publisher' && github.ref == 'refs/heads/main'
+    environment: apt-publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Mask the account id and the bucket name
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          echo "::add-mask::$R2_ACCOUNT_ID"
+          echo "::add-mask::$R2_BUCKET"
+
+      - name: Check out LumenOS's main (read-only token)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: RidoMr/LumenOS
+          ref: refs/heads/main
+          token: ${{ secrets.LUMENOS_READ_TOKEN }}
+          path: lumenos
+          persist-credentials: false
+
+      - name: Start the ubuntu:26.04 tools container
+        run: |
+          mkdir work
+          docker run --detach --init --name tools --volume "$PWD/lumenos:/kit:ro" --volume "$PWD/work:/work" \
+            --env LUMENOS_IN_BUILD_CONTAINER=1 --env PYTHONDONTWRITEBYTECODE=1 ubuntu:26.04 sleep infinity >/dev/null
+          docker exec tools sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          docker exec tools apt-get update -q
+          docker exec --env DEBIAN_FRONTEND=noninteractive tools apt-get install -y -q --no-install-recommends \
+            apt-utils ca-certificates gnupg gpgv python3
+          python3 lumenos/tools/packaging/openpgp.py dearmor \
+            lumenos/packaging/lumenos-archive-keyring/lumenos-archive-keyring.asc >work/keyring.gpg
+
+      - name: Read what is published
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: python3 lumenos/tools/packaging/apt_publish.py fetch-state --out work/state
+
+      - name: Compare main's build inputs with the published ones
+        id: inputs
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          docker exec --workdir /work tools python3 /kit/tools/packaging/apt_publish.py inputs \
+            --kit /kit --state state --keyring keyring.gpg --out inputs.json --force "$FORCE"
+          echo "publish=$(jq -r 'if .publish then "true" else "false" end' work/inputs.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Build the packages, each in its own ubuntu:26.04 container (logs stay private)
+        if: steps.inputs.outputs.publish == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs"
+          for script in lumenos/packaging/*/build.sh; do
+            name="$(basename "$(dirname "$script")")"
+            version="$(jq -r --arg name "$name" '.newest[$name] // ""' work/inputs.json)"
+            options=()
+            if [ -n "$version" ]; then
+              options=(--ubuntu-version "$version")
+            fi
+            if ! bash lumenos/packaging/build-in-docker.sh "$name" --out "work/built/$name" "${options[@]}" \
+              >"$RUNNER_TEMP/logs/$name.log" 2>&1; then
+              echo "::error::The build of $name failed; its log is not shown in this public repository. Reproduce it in LumenOS: bash packaging/build-in-docker.sh $name --out /tmp/$name ${options[*]}"
+              exit 1
+            fi
+            echo "Built $name: $(find "work/built/$name" -maxdepth 1 -name '*.deb' -printf '%f ' | sort)"
+          done
+
+      - name: Install them in a fresh ubuntu:26.04 container and check them (log stays private)
+        if: steps.inputs.outputs.publish == 'true'
+        run: |
+          if ! docker run --rm --init --volume "$PWD/lumenos:/kit:ro" --volume "$PWD/work/built:/built:ro" \
+            --env LUMENOS_IN_BUILD_CONTAINER=1 --workdir /kit ubuntu:26.04 \
+            bash tools/packaging/install_check.sh /built >"$RUNNER_TEMP/logs/install-check.log" 2>&1; then
+            echo "::error::The install check failed; its log is not shown in this public repository. Reproduce it in LumenOS: build the packages into DIR as above, then docker run --rm -v \"\$PWD:/kit:ro\" -v DIR:/built:ro -e LUMENOS_IN_BUILD_CONTAINER=1 -w /kit ubuntu:26.04 bash tools/packaging/install_check.sh /built"
+            exit 1
+          fi
+          echo "The install check passed."
+
+      - name: Merge with the published index
+        id: merge
+        if: steps.inputs.outputs.publish == 'true'
+        run: |
+          python3 lumenos/tools/packaging/apt_publish.py local-debs --kit lumenos --built work/built \
+            --inputs work/inputs.json --out work/incoming
+          docker exec --workdir /work tools bash /kit/packaging/lumenos-archive-keyring/make-deb.sh --out keyring
+          docker exec --workdir /work tools python3 /kit/tools/packaging/apt_repo.py build --state state \
+            --incoming incoming --incoming keyring --keyring keyring.gpg \
+            --withdrawn /kit/packaging/apt-withdrawn.txt --out out
+          cat work/out/summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo "changed=$(jq -r 'if .changed then "true" else "false" end' work/out/plan.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Start the signing container (dists and the public keyring only, then no network)
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          docker run --detach --init --name signer --volume "$PWD/lumenos:/kit:ro" \
+            --volume "$PWD/work/out/repo/dists:/out/repo/dists" --volume "$PWD/work/keyring.gpg:/keyring.gpg:ro" \
+            --env PYTHONDONTWRITEBYTECODE=1 ubuntu:26.04 sleep infinity >/dev/null
+          docker exec signer apt-get update -q
+          docker exec --env DEBIAN_FRONTEND=noninteractive signer apt-get install -y -q --no-install-recommends \
+            gnupg python3
+          docker network disconnect bridge signer
+          if docker exec signer python3 -c 'import socket; socket.create_connection(("1.1.1.1", 443), 5)' 2>/dev/null; then
+            echo "::error::The signing container still reaches the network."
+            exit 1
+          fi
+
+      - name: Sign with SHA512 (the key reaches the signing command alone)
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          APT_SIGNING_PASSPHRASE: ${{ secrets.APT_SIGNING_PASSPHRASE }}
+        run: |
+          status=0
+          docker exec --env APT_SIGNING_KEY --env APT_SIGNING_PASSPHRASE signer \
+            python3 /kit/tools/packaging/apt_repo.py sign --out /out --keyring /keyring.gpg || status=$?
+          docker rm --force signer >/dev/null
+          exit "$status"
+
+      - name: Check it with gpgv and apt (update, policy, download, install the keyring package)
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          docker exec --workdir /work tools python3 /kit/tools/packaging/apt_repo.py verify --out out \
+            --keyring keyring.gpg --install-keyring
+
+      - name: Upload the pool first and InRelease last, check every object, prune, record the inputs
+        if: steps.inputs.outputs.publish == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: python3 lumenos/tools/packaging/apt_publish.py upload --out work/out --inputs work/inputs.json --quiet
+
+      - name: Read the published index back and show its key and packages
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          python3 lumenos/tools/packaging/apt_publish.py fetch-state --out work/published
+          docker exec --workdir /work tools python3 /kit/tools/packaging/apt_repo.py show --state published \
+            --keyring keyring.gpg | tee -a "$GITHUB_STEP_SUMMARY"
