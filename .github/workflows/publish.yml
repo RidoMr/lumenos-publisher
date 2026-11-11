@@ -14,7 +14,9 @@ name: Publish LumenOS packages
 # One job, in the environment apt-publish (deployment branch main), which holds the secrets:
 #   1. checks out LumenOS's branch main with a read-only token, and fetches only main's history and
 #      the release tags, quietly (tools/packaging/kit_release.py fetch): no other branch's name is
-#      printed;
+#      printed; and, only when the runner's own resolver cannot resolve Ubuntu's archive, gives
+#      docker two public resolvers for this run's containers (publisher/container_dns.sh): apt
+#      checks the archive's signatures whichever resolver answered;
 #   2. reads what is published and stops early when main's build inputs (Ubuntu's newest version
 #      of every rebuilt package, the newest kit release and every file of packaging/ and
 #      tools/packaging/) equal the published ones, unless a run by hand asks for a forced one. It
@@ -85,6 +87,10 @@ jobs:
         env:
           LUMENOS_READ_TOKEN: ${{ secrets.LUMENOS_READ_TOKEN }}
         run: python3 lumenos/tools/packaging/kit_release.py fetch --repo lumenos
+
+      - name: Give the containers public resolvers when the runner cannot resolve Ubuntu's archive
+        # Nothing changes while the runner's own resolver answers (container_dns.sh; issue #409).
+        run: bash lumenos/tools/packaging/publisher/container_dns.sh
 
       - name: Start the ubuntu:26.04 tools container
         run: |
